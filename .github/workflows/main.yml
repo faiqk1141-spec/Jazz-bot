@@ -1,0 +1,22 @@
+name: JazzDrive Bot v6
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install ffmpeg and p7zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --fix-missing ffmpeg p7zip-full
+
+      - name: Run Bot
+        run: bash start.sh
