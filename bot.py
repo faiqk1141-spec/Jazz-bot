@@ -11,9 +11,70 @@ WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, l
 VIDEO_EXTS = [".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"]
 ZIP_EXTS   = [".zip", ".rar", ".7z", ".tar", ".gz"]
 MAX_SIZE_MB = 1990
+TMDB_API_KEY = "e788be7e4b8f7275eb274e76f08832d9"
+
+def tmdb_info(query):
+    try:
+        base = "https://api.themoviedb.org/3"
+        r = requests.get(base + "/search/multi", params={
+            "api_key": TMDB_API_KEY, "query": query, "include_adult": True
+        }, timeout=10)
+        results = [x for x in r.json().get("results", []) if x.get("media_type") in ("movie", "tv")]
+        if not results:
+            return None, None
+        res = results[0]
+        mtype = res.get("media_type", "movie")
+        mid = res["id"]
+        if mtype == "tv":
+            d = requests.get(base + "/tv/" + str(mid), params={"api_key": TMDB_API_KEY}, timeout=10).json()
+            title = d.get("name", "N/A")
+            year = d.get("first_air_date", "")[:4]
+            rt = d.get("episode_run_time", [])
+            runtime = (str(rt[0]) + " min/ep") if rt else "N/A"
+            extra = "Seasons: " + str(d.get("number_of_seasons", "N/A")) + " | Episodes: " + str(d.get("number_of_episodes", "N/A"))
+        else:
+            d = requests.get(base + "/movie/" + str(mid), params={"api_key": TMDB_API_KEY}, timeout=10).json()
+            title = d.get("title", "N/A")
+            year = d.get("release_date", "")[:4]
+            rt = d.get("runtime", 0)
+            runtime = (str(rt) + " min") if rt else "N/A"
+            extra = ""
+        genres = ", ".join([g["name"] for g in d.get("genres", [])])
+        countries = ", ".join([c["name"] for c in d.get("production_countries", [])])
+        languages = ", ".join([l["english_name"] for l in d.get("spoken_languages", [])])
+        overview = d.get("overview", "N/A")
+        if len(overview) > 350:
+            overview = overview[:350] + "..."
+        rating = d.get("vote_average", 0)
+        poster = d.get("poster_path", "")
+        poster_url = ("https://image.tmdb.org/t/p/w500" + poster) if poster else None
+        tag = "Movie" if mtype == "movie" else "Series"
+        lines = [
+            tag + ": " + title + " (" + year + ")",
+            "",
+            "Rating: " + str(round(rating, 1)) + "/10",
+            "Country: " + (countries or "N/A"),
+            "Language: " + (languages or "N/A"),
+            "Duration: " + runtime,
+            "Genre: " + (genres or "N/A"),
+        ]
+        if extra:
+            lines.append(extra)
+        lines.append("")
+        lines.append("Story:")
+        lines.append(overview)
+        return "\n".join(lines), poster_url
+    except Exception as e:
+        return "Error: " + str(e), None
+
+
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN missing! GitHub repo > Settings > Secrets and variables > Actions me BOT_TOKEN add karein.")
 
 BOTS = [
-    {"token": "9134214502:AAGm1L5zmUnRWN64O7_xGfeCsSd1LXb2euk", "chat_id": 6288093086, "state_file": "state1.json"},
+    {"token": BOT_TOKEN, "chat_id": 6288093086, "state_file": "state1.json"},
 ]
 
 ALLOWED_USERS_FILE = "allowed_users.json"
@@ -81,7 +142,10 @@ def get_index_wait(size_bytes):
     if mb <= 1200: return 30
     return 40
 
-# ─── JazzDrive API helpers ────────────────────────────────────
+# ─── JazzDrive API helpers (from v5) ─────────────────────────
+
+def cookie_file(state_file):
+    return state_file  # state_file is already the cookie file
 
 def load_cookies(state_file):
     if not os.path.exists(state_file): return None, None
@@ -135,6 +199,7 @@ def api_generate_share_link(item_id, is_folder, cookies, key):
     except: return None
 
 def api_upload_file(local_path, filename, folder_id, cookies, key, cancelled_flag=None):
+    """Upload file directly via JazzDrive REST API — no Playwright needed"""
     fsize = os.path.getsize(local_path)
     mime  = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
     meta  = {
@@ -224,10 +289,17 @@ class BotInstance:
             cookies, key = load_cookies(self.state_file)
             if not cookies or not key: continue
             try:
-                api_get_folders(cookies, key)
+                api_get_folders(cookies, key)  # lightweight API call
             except: pass
 
-    # ─── LOGIN (Playwright) ───────────────────────────────────
+    def session_ok(self):
+        """Asli check: state file + validationKey cookie + JazzDrive API sach me jawab de."""
+        cookies, key = load_cookies(self.state_file)
+        if not cookies or not key: return False
+        _, root_id = api_get_folders(cookies, key)
+        return bool(root_id)
+
+    # ─── LOGIN (Playwright — only for login) ─────────────────
 
     def do_login(self, page, context):
         self.msg("LOGIN REQUIRED\n\nJazz number bhejein\nFormat: 03XXXXXXXXX")
@@ -256,15 +328,26 @@ class BotInstance:
                 f = page.locator(f"//input[@aria-label='Digit {i}']")
                 if f.is_visible(): f.fill(digit); time.sleep(0.2)
             except: pass
+        # login poora hone ka wait (msisdn field gayab ho jaye)
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                if not page.locator("#msisdn").is_visible(): break
+            except: break
         time.sleep(5)
         self.take_screenshot(page, "OTP submit")
         context.storage_state(path=self.state_file)
-        self.msg("LOGIN SUCCESSFUL!\nSession save!\nLink bhejein")
         self.ctx["state"] = "IDLE"
-        return True
+        if self.session_ok():
+            self.msg("LOGIN SUCCESSFUL!\nSession save!\nLink bhejein")
+            return True
+        self.msg("Login fail! OTP ghalat ya expire ho gaya.\n/checklogin dobara karo")
+        return False
 
     def check_login_status(self):
         self.msg("Jazz Drive login check...")
+        if self.session_ok():
+            self.msg("LOGIN VALID!\nLink bhejein!"); return
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
             ctx = browser.new_context(
@@ -274,12 +357,14 @@ class BotInstance:
             page = ctx.new_page()
             try:
                 page.goto("https://cloud.jazzdrive.com.pk/", wait_until="networkidle", timeout=90000)
-                time.sleep(3)
+                try: page.locator("#msisdn").wait_for(state="visible", timeout=20000)
+                except: pass
                 if page.locator("#msisdn").is_visible():
-                    self.msg("Session expire!\nLogin karte hain...")
+                    self.msg("Session nahi hai / expire!\nLogin karte hain...")
                     self.do_login(page, ctx)
                 else:
-                    self.msg("LOGIN VALID!\nLink bhejein!")
+                    self.take_screenshot(page, "Login page detect nahi hua")
+                    self.msg("Login form nahi mila. Screenshot dekho. Dobara /checklogin try karo.")
             except Exception as e: self.msg(f"Error: {str(e)[:150]}")
             finally: browser.close()
 
@@ -293,17 +378,106 @@ class BotInstance:
         if is_m3u8(url):
             if not out_path.endswith('.mp4'):
                 out_path = out_path.rsplit('.', 1)[0] + '.mp4'
-            for ref in referers[:2]:
+
+            # ffmpeg auto-install
+            os.system("apt-get install -y ffmpeg > /dev/null 2>&1")
+
+            # surrit.com ya kisi bhi M3U8 ke liye referers
+            m3u8_referers = [
+                urlparse(url).scheme + "://" + urlparse(url).netloc + "/",
+                "https://www.google.com/",
+                "",
+            ]
+
+            for ref in m3u8_referers:
                 if self.is_cancelled(task_id): return None, "Cancelled"
                 clean(out_path)
                 try:
-                    cmd = ["ffmpeg", "-y"]
-                    if ref: cmd += ["-headers", f"Referer: {ref}\r\nUser-Agent: {WEB_UA}\r\n"]
-                    else: cmd += ["-user_agent", WEB_UA]
-                    cmd += ["-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", out_path]
-                    subprocess.run(cmd, capture_output=True, timeout=600)
-                    if file_ok(out_path): return out_path, "Success"
-                except Exception as e: last_error = str(e)
+                    headers_str = f"User-Agent: {WEB_UA}\r\n"
+                    if ref:
+                        headers_str += f"Referer: {ref}\r\nOrigin: {ref.rstrip('/')}\r\n"
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-headers", headers_str,
+                        "-i", url,
+                        "-c", "copy",
+                        "-bsf:a", "aac_adtstoasc",
+                        "-movflags", "+faststart",
+                        out_path
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, timeout=3600)
+                    if file_ok(out_path, min_mb=0.1): return out_path, "Success"
+                    last_error = result.stderr.decode()[-200:] if result.stderr else "ffmpeg fail"
+                except Exception as e:
+                    last_error = str(e)
+
+            # yt-dlp fallback with impersonation (Cloudflare bypass)
+            try:
+                import yt_dlp
+                clean(out_path)
+                base_out = out_path.rsplit(".", 1)[0]
+                for impersonate in ["chrome", "safari", None]:
+                    clean(out_path)
+                    try:
+                        ydl_opts = {
+                            "outtmpl": base_out + ".%(ext)s",
+                            "quiet": True, "no_warnings": True,
+                            "format": "best",
+                            "http_headers": {
+                                "User-Agent": WEB_UA,
+                                "Referer": urlparse(url).scheme + "://" + urlparse(url).netloc + "/",
+                            },
+                            "merge_output_format": "mp4",
+                        }
+                        if impersonate:
+                            ydl_opts["impersonate"] = impersonate
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([url])
+                        for ext in [".mp4", ".mkv", ".ts", ".webm"]:
+                            if file_ok(base_out + ext, min_mb=0.1):
+                                return base_out + ext, "Success"
+                        if file_ok(out_path, min_mb=0.1):
+                            return out_path, "Success"
+                    except Exception as e:
+                        last_error = f"yt-dlp({impersonate}): {str(e)[:100]}"
+            except Exception as e:
+                last_error = f"yt-dlp m3u8: {str(e)[:150]}"
+
+            # curl_cffi fallback — Cloudflare bypass
+            try:
+                os.system("pip install -q curl_cffi > /dev/null 2>&1")
+                from curl_cffi import requests as cf_requests
+                clean(out_path)
+                # M3U8 playlist fetch
+                cf_sess = cf_requests.Session(impersonate="chrome110")
+                r = cf_sess.get(url, timeout=30)
+                r.raise_for_status()
+                m3u8_content = r.text
+                base_url = url.rsplit("/", 1)[0] + "/"
+                # Parse segments
+                segments = [line.strip() for line in m3u8_content.splitlines()
+                            if line.strip() and not line.startswith("#")]
+                if segments:
+                    self.msg(f"M3U8 segments: {len(segments)} — downloading...")
+                    ts_path = out_path.replace(".mp4", ".ts")
+                    with open(ts_path, "wb") as out_f:
+                        for seg in segments:
+                            seg_url = seg if seg.startswith("http") else base_url + seg
+                            try:
+                                seg_r = cf_sess.get(seg_url, timeout=60)
+                                out_f.write(seg_r.content)
+                            except: pass
+                    # Convert ts to mp4
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", ts_path, "-c", "copy", out_path],
+                        capture_output=True, timeout=600
+                    )
+                    clean(ts_path)
+                    if file_ok(out_path, min_mb=0.1):
+                        return out_path, "Success"
+            except Exception as e:
+                last_error = f"curl_cffi: {str(e)[:150]}"
+
             return None, f"M3U8 fail: {last_error}"
 
         try:
@@ -388,45 +562,47 @@ class BotInstance:
     # ─── Split ────────────────────────────────────────────────
 
     def split_video(self, filepath):
+        import glob
         size_mb = os.path.getsize(filepath) / (1024*1024)
         if size_mb <= MAX_SIZE_MB: return [filepath]
-        self.msg(f"File {size_mb:.0f}MB — splitting...")
-        base = filepath.rsplit(".", 1)[0]; ext = filepath.rsplit(".", 1)[-1]
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-            capture_output=True, text=True)
-        try: total = float(result.stdout.strip())
-        except: return [filepath]
-        n = int(size_mb / MAX_SIZE_MB) + 1
-        dur = total / n
-        parts = []
-        for i in range(n):
-            pp = f"{base}_part{i+1}.{ext}"
-            subprocess.run(["ffmpeg", "-y", "-i", filepath,
-                "-ss", str(i*dur), "-t", str(dur), "-c", "copy", pp],
-                capture_output=True, timeout=3600)
-            if os.path.exists(pp) and os.path.getsize(pp) > 1024: parts.append(pp)
-        if parts: clean(filepath)
-        return parts if parts else [filepath]
+        self.msg(f"File {size_mb:.0f}MB — 7zip parts bana raha hoon...")
+        os.system("apt-get install -y p7zip-full > /dev/null 2>&1")
+        base = filepath.rsplit(".", 1)[0]
+        archive_base = f"{base}.7z"
+        for old_part in glob.glob(f"{archive_base}.*"):
+            try: os.remove(old_part)
+            except: pass
+        subprocess.run(
+            ["7z", "a", f"-v{MAX_SIZE_MB}m", archive_base, filepath],
+            capture_output=True, timeout=7200
+        )
+        parts = sorted(glob.glob(f"{archive_base}.*"))
+        if parts:
+            clean(filepath)
+            self.msg(f"{len(parts)} parts bane! Upload shuru...")
+            return parts
+        self.msg("7zip fail — original file upload karega...")
+        return [filepath]
 
-    # ─── Upload via API ───────────────────────────────────────
+    # ─── Upload via API (no Playwright) ──────────────────────
 
     def upload_file_api(self, local_path, filename, folder_id, task_id=None):
         cookies, key = load_cookies(self.state_file)
         if not cookies or not key:
-            self.msg("Session nahi hai — /checklogin karo")
-            return None
+            self.msg("Session nahi hai — /checklogin karo"); return None
 
         fname = safe_filename(filename) or os.path.basename(local_path)
         fsize = os.path.getsize(local_path)
         self.msg(f"Uploading {fname[:50]}...\n{fmt_bytes(fsize)}")
 
-        upload_done  = threading.Event()
-        upload_start = time.time()
+        # ── Har 1 minute progress update ──
+        upload_done   = threading.Event()
+        upload_start  = time.time()
 
         def jazzdrive_screenshot(minute):
+            """JazzDrive website ka live screenshot lo"""
             try:
+                from playwright.sync_api import sync_playwright
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
                     ctx = browser.new_context(
@@ -436,7 +612,7 @@ class BotInstance:
                     page = ctx.new_page()
                     page.goto("https://cloud.jazzdrive.com.pk/#folders",
                               wait_until="networkidle", timeout=30000)
-                    time.sleep(3)
+                    import time as t; t.sleep(3)
                     path = f"/tmp/jd_shot_{minute}.png"
                     page.screenshot(path=path, full_page=False)
                     browser.close()
@@ -466,22 +642,22 @@ class BotInstance:
             )
         except Exception as e:
             upload_done.set()
-            self.msg(f"Upload error: {str(e)[:150]}")
-            return None
+            self.msg(f"Upload error: {str(e)[:150]}"); return None
         finally:
             upload_done.set()
 
         if not success or not file_id:
-            self.msg("Upload fail!")
-            return None
+            self.msg("Upload fail!"); return None
 
         elapsed_total = int(time.time() - upload_start)
         self.msg(f"Upload complete! ({elapsed_total}s)\n{fmt_bytes(fsize)}")
 
+        # Wait for indexing
         wait = get_index_wait(fsize)
         self.msg(f"Indexing... ({wait}s)")
         time.sleep(wait)
 
+        # Generate share link
         link = api_generate_share_link(file_id, False, cookies, key)
         return link
 
@@ -498,34 +674,28 @@ class BotInstance:
             clean(part)
         return links
 
-    # ─── BUG FIX: get_folder_id — ab sahi values return karta hai ───
-
     def get_folder_id(self, folder_name):
+        """folder_name se ID dhundo — nahi mila to root ID lo"""
         cookies, key = load_cookies(self.state_file)
-        if not cookies or not key:
-            self.msg("Session nahi hai — /checklogin karo")
-            return None, None, None
-
+        if not cookies or not key: return None, None
         folders, root_id = api_get_folders(cookies, key)
-        if not root_id:
-            self.msg("Folder list nahi mili — /checklogin karo")
-            return None, None, None
-
-        if not folder_name or folder_name.strip().upper() == "ROOT":
+        if not root_id: return None, None
+        if not folder_name or folder_name.upper() == "ROOT":
             return root_id, cookies, key
-
         # Case-insensitive match
         for name, fid in folders:
             if name.strip().lower() == folder_name.strip().lower():
                 return fid, cookies, key
-
-        # Folder nahi mila — root mein upload
-        self.msg(f"Folder '{folder_name}' nahi mila — root mein upload ho raha hai")
+        # Nahi mila — root mein upload
+        self.msg(f"Folder '{folder_name}' nahi mila — root mein upload")
         return root_id, cookies, key
 
     # ─── Processors ───────────────────────────────────────────
 
     def process_direct(self, url, filename, folder_name="", task_id=None):
+        if not self.session_ok():
+            self.msg("Jazz Drive login nahi hai!\nPehle /checklogin karke login karein, phir link dobara bhejein."); return
+        # YouTube
         if any(x in url for x in ["youtube.com/watch", "youtu.be/", "youtube.com/shorts"]):
             self.msg("YouTube link!\nCobalt se direct link nikal raha hoon...")
             direct, quality = self.youtube_to_direct(url)
@@ -541,25 +711,22 @@ class BotInstance:
         self.msg(f"Downloading...\n{fname[:60]}")
 
         result, err = self.download_file(url, out_path, task_id)
-        if not result:
-            self.msg(f"Download fail!\n{err[:200]}")
-            return
+        if not result: self.msg(f"Download fail!\n{err[:200]}"); return
 
         sz = os.path.getsize(result) / (1024*1024)
         self.msg(f"Downloaded! {sz:.1f} MB")
 
-        # BUG FIX: folder_id properly extract ho raha hai
-        folder_id, cookies, key = self.get_folder_id(folder_name)
-        if not folder_id:
-            self.msg("Session problem — /checklogin karo")
-            clean(out_path)
-            return
+        result_folder = self.get_folder_id(folder_name)
+        folder_id = result_folder[0] if result_folder else None
+        if not folder_id: self.msg("Session problem — /checklogin karo"); clean(out_path); return
 
         links = self.upload_with_split(result, folder_id, task_id)
         if links: self.msg(f"Upload Done!\n\nShare Link:\n{links[0]}")
         else: self.msg("Upload Done!\n(Share link nahi mila)")
 
     def process_zip(self, url, folder_name="", task_id=None):
+        if not self.session_ok():
+            self.msg("Jazz Drive login nahi hai!\nPehle /checklogin karke login karein, phir link dobara bhejein."); return
         import shutil
         zip_path    = f"/tmp/series_{self.chat_id}.zip"
         extract_dir = f"/tmp/series_{self.chat_id}_extracted"
@@ -570,8 +737,7 @@ class BotInstance:
         self.msg("ZIP/Season download ho raha hai...")
         result, err = self.download_file(url, zip_path, task_id)
         if not result or not file_ok(zip_path):
-            self.msg(f"ZIP fail!\n{err[:200]}")
-            return
+            self.msg(f"ZIP fail!\n{err[:200]}"); return
 
         sz = os.path.getsize(zip_path) / (1024*1024)
         self.msg(f"Downloaded! {sz:.1f} MB\nExtracting...")
@@ -590,24 +756,21 @@ class BotInstance:
             for f in sorted(files):
                 if is_video_file(f): video_files.append(os.path.join(root, f))
 
-        if not video_files:
-            self.msg("ZIP mein koi video nahi mili!")
-            return
+        if not video_files: self.msg("ZIP mein koi video nahi mili!"); return
         self.msg(f"Total {len(video_files)} Episodes!\nUpload shuru...")
 
-        # BUG FIX: get_folder_id properly use ho raha hai
-        target_id, cookies, key = self.get_folder_id(folder_name)
-        if not target_id:
-            self.msg("Session problem — /checklogin karo")
-            return
+        # Get/create folder
+        cookies, key = load_cookies(self.state_file)
+        if not cookies or not key: self.msg("Session problem!"); return
+        folders, root_id = api_get_folders(cookies, key)
+        if not root_id: self.msg("Folder list fail!"); return
 
-        # Agar folder_name diya hai aur root nahi — create karo agar nahi mila
-        if folder_name and folder_name.strip().upper() != "ROOT":
-            folders, root_id = api_get_folders(cookies, key)
+        if folder_name and folder_name.upper() != "ROOT":
             match = next((fid for name, fid in folders if name.lower() == folder_name.lower()), None)
-            if not match:
-                target_id = api_create_folder(folder_name, target_id, cookies, key)
-                self.msg(f"Folder '{folder_name}' create kiya!")
+            target_id = match if match else api_create_folder(folder_name, root_id, cookies, key)
+            if not match: self.msg(f"Folder '{folder_name}' nahi mila — create kiya")
+        else:
+            target_id = root_id
 
         all_links = []
         for i, vp in enumerate(video_files, 1):
@@ -621,6 +784,7 @@ class BotInstance:
 
         shutil.rmtree(extract_dir, ignore_errors=True)
 
+        # Folder share link
         folder_link = api_generate_share_link(target_id, True, cookies, key)
         report = f"SEASON COMPLETE!\nTotal {len(all_links)} episodes.\n\n"
         report += "\n".join(all_links)
@@ -824,6 +988,29 @@ class BotInstance:
                 bot.reply_to(m, f"User {uid} removed.")
             except: bot.reply_to(m, "Invalid user_id")
 
+
+        @bot.message_handler(commands=["info"])
+        def cmd_info(m):
+            if m.chat.id not in self.allowed:
+                return
+            query = m.text.replace("/info", "", 1).strip()
+            if not query:
+                bot.reply_to(m, "Format:\n/info Avatar\n/info Breaking Bad")
+                return
+            bot.reply_to(m, "Searching: " + query + "...")
+            text, poster_url = tmdb_info(query)
+            if not text:
+                bot.reply_to(m, "Koi result nahi mila!")
+                return
+            try:
+                if poster_url:
+                    img = requests.get(poster_url, timeout=10).content
+                    bot.send_photo(m.chat.id, img, caption=text)
+                else:
+                    bot.send_message(m.chat.id, text)
+            except Exception as e:
+                bot.reply_to(m, text)
+
         @bot.message_handler(commands=["cmd"])
         def cmd_shell(m):
             if m.chat.id != self.chat_id: return
@@ -876,11 +1063,33 @@ class BotInstance:
             else:
                 bot.reply_to(m, "Link bhejein ya /start dekho")
 
+    def clear_webhook(self):
+        """409 fix: Telegram pe webhook active ho to getUpdates (polling) kaam nahi karta."""
+        for attempt in range(5):
+            try:
+                info = self.bot.get_webhook_info()
+                if info.url:
+                    print(f"[webhook] active tha: {info.url} -> delete kar raha hoon", flush=True)
+                self.bot.delete_webhook(drop_pending_updates=True)
+                print("[webhook] cleared", flush=True)
+                return True
+            except Exception as e:
+                print(f"[webhook] clear attempt {attempt+1} failed: {e}", flush=True)
+                time.sleep(3)
+        return False
+
     def run(self):
+        self.clear_webhook()
         self.register_handlers()
         threading.Thread(target=self.session_ping_loop, daemon=True).start()
         self.msg("BOT ONLINE!\n\nDirect / M3U8 / ZIP / YouTube link bhejein\n/start dekho commands ke liye")
-        self.bot.infinity_polling()
+        while True:
+            try:
+                self.bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+            except Exception as e:
+                print(f"[polling] crashed: {e}", flush=True)
+            time.sleep(5)
+            self.clear_webhook()
 
 
 # ─── Main ─────────────────────────────────────────────────────
