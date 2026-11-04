@@ -5,18 +5,29 @@ on:
   schedule:
     - cron: '0 */5 * * *'
 
+# Sirf ek instance chale: naya run purane ko cancel kar de (409 conflict se bachne ke liye)
+concurrency:
+  group: jazzdrive-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Install ffmpeg and p7zip
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg, aria2 and p7zip
         run: |
           sudo apt-get update
-          sudo apt-get install -y --fix-missing ffmpeg p7zip-full
+          sudo apt-get install -y --fix-missing ffmpeg aria2 p7zip-full
 
       - name: Run Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: bash start.sh
